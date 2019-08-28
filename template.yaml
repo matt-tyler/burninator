@@ -1,0 +1,152 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Parameters: {}
+Globals:
+  Function:
+    Runtime: nodejs10.x
+    Timeout: 20
+    ReservedConcurrentExecutions: 1
+    Tracing: Active
+Resources:
+  ListResourceGroups:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: index.handler
+      CodeUri: src/ListResourceGroups
+      Policies:
+        - Statement:
+          - Action: resource-groups:ListGroups
+            Effect: Allow
+            Resource: !Sub "arn:${AWS::Partition}:resource-groups:${AWS::Region}:${AWS::AccountId}:/groups-list"
+
+  ListResources:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: index.handler
+      CodeUri: src/ListResources
+      Policies:
+        - "arn:aws:iam::aws:policy/ReadOnlyAccess"
+        - Statement:
+          - Action: resource-groups:ListGroupResources
+            Effect: Allow
+            Resource: !Sub "arn:${AWS::Partition}:resource-groups:${AWS::Region}:${AWS::AccountId}:group*"
+
+  EnqueueResources:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: index.handler
+      CodeUri: src/EnqueueResources
+      Environment:
+        Variables:
+          QUEUE_URL: !Ref Queue
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt Queue.QueueName
+
+  ResourceGroupsLister:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TimeoutInMinutes: 5
+      TemplateURL: ./template_lister.yaml
+      Parameters:
+        ListerArn: !GetAtt ListResourceGroups.Arn
+        ProcessorArn: !GetAtt ResourceGroupsIterator.Outputs.Arn
+  
+  ResourcesLister:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TimeoutInMinutes: 5
+      TemplateURL: ./template_lister.yaml
+      Parameters:
+        ListerArn: !GetAtt ListResources.Arn
+        ProcessorArn: !Ref ProcessResourceGroups
+        Input: >-
+          {
+            "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID.$": "$$.Execution.Id",
+            "GroupArn.$": "$.Input.Iterator.Params.GroupArn",
+            "Items.$": "$.Input.Items.Values"
+          }
+
+  ResourceGroupsIterator:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TimeoutInMinutes: 5
+      TemplateURL: ./template_iterator.yaml
+      Parameters:
+        ProcessorArn: !GetAtt ResourcesLister.Outputs.Arn
+        Input: >-
+          {
+            "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID.$": "$$.Execution.Id",
+            "Input": {
+              "Iterator": { 
+                "Params": { 
+                  "GroupName.$": "$.Items.Values[0].GroupName",
+                  "GroupArn.$": "$.Items.Values[0].GroupArn"
+                }
+              }
+            }
+          }
+
+  ProcessResourceGroups:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      RoleArn: !GetAtt StatesExecutionRole.Arn
+      DefinitionString: !Sub |
+        {
+          "StartAt": "EnqueueResources",
+          "States": {
+            "EnqueueResources": {
+              "Type": "Task",
+              "Resource": "${EnqueueResources.Arn}",
+              "Parameters": {
+                "Items.$": "$.Items"
+              },
+              "ResultPath": "$.Result",
+              "Next": "EnqueueResourceGroup"
+            },
+            "EnqueueResourceGroup": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sqs:sendMessage",
+              "Parameters": {
+                "QueueUrl": "${Queue}",
+                "MessageBody": "0",
+                "MessageAttributes": {
+                  "ResourceType": {
+                    "DataType": "String",
+                    "StringValue": "AWS::ResourceGroups::Group"
+                  },
+                  "ResourceArn": {
+                    "DataType": "String",
+                    "StringValue.$": "$.GroupArn"
+                  }
+                }
+              },
+              "End": true
+            }
+          }
+        }
+
+  StatesExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: states.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: StatesExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt EnqueueResources.Arn
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt Queue.Arn
+
+  Queue:
+    Type: AWS::SQS::Queue

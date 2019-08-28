@@ -1,0 +1,104 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Parameters:
+  ProcessorArn:
+    Type: String
+  Input:
+    Type: String
+    Default: >-
+      {
+        "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID.$": "$$.Execution.Id",
+        "Item.$": "$.Items.Values[0]" 
+      }
+Resources:
+  LambdaBasicExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+  
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Policies:
+        - PolicyName: Root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt Iterate.Arn
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref ProcessorArn
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: states.amazonaws.com
+            Action: "sts:AssumeRole"
+
+  Iterate:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: nodejs8.10
+      Role: !GetAtt LambdaBasicExecutionRole.Arn
+      Code:
+        ZipFile: |
+          exports.handler = async ({ Values }) => Promise.resolve({ Values, Count: Values.length });
+
+  Iterator:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      RoleArn: !GetAtt StateMachineRole.Arn
+      DefinitionString: !Sub |
+        {
+          "StartAt": "Fork",
+          "States": {
+            "Fork": {
+              "Type": "Choice",
+              "Default": "Succeed",
+              "Choices": [
+                {
+                  "Variable": "$.Items.Count",
+                  "NumericGreaterThan": 0,
+                  "Next": "ProcessItem"
+                }
+              ]
+            },
+            "ProcessItem": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::states:startExecution",
+              "Parameters": {
+                "Input": ${Input},
+                "StateMachineArn": "${ProcessorArn}"
+              },
+              "ResultPath": "$.Result",
+              "Next": "IterateItems"
+            },
+            "IterateItems": {
+              "Type": "Task",
+              "Resource": "${Iterate.Arn}",
+              "Parameters": {
+                "Values.$": "$.Items.Values[1:]"
+              },
+              "ResultPath": "$.Items",
+              "Next": "Fork"
+            },
+            "Succeed" : {
+              "Type": "Succeed"
+            }
+          }
+        }
+
+Outputs:
+  Arn:
+    Value: !Ref Iterator

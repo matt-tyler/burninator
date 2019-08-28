@@ -1,0 +1,81 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Parameters:
+  ListerArn:
+    Type: String
+  ProcessorArn:
+    Type: String
+  Input:
+    Type: String
+    Default: >-
+      {
+        "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID.$": "$$.Execution.Id",
+        "Items.$": "$.Input.Items"
+      }
+Resources:
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Policies:
+        - PolicyName: Root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Ref ListerArn
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref ProcessorArn
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: states.amazonaws.com
+            Action: "sts:AssumeRole"
+
+  Lister:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      RoleArn: !GetAtt StateMachineRole.Arn
+      DefinitionString: !Sub |
+        {
+          "StartAt": "ListItems",
+          "States": {
+            "ListItems": {
+              "Type": "Task",
+              "Resource": "${ListerArn}",
+              "InputPath": "$.Input",
+              "ResultPath": "$.Input",
+              "Next": "ProcessItems"
+            },
+            "ProcessItems": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::states:startExecution",
+              "Parameters": {
+                "Input": ${Input},
+                "StateMachineArn": "${ProcessorArn}"
+              },
+              "ResultPath": "$.Result",
+              "Next": "While"
+            },
+            "While": {
+              "Type": "Choice",
+              "Default": "Succeed",
+              "Choices": [
+                {
+                  "Variable": "$.Input.Iterator.Continue",
+                  "BooleanEquals": true,
+                  "Next": "ListItems"
+                }
+              ]
+            },
+            "Succeed" : {
+              "Type": "Succeed"
+            }
+          }
+        }
+
+Outputs:
+  Arn:
+    Value: !Ref Lister
