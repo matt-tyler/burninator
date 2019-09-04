@@ -1,6 +1,7 @@
 import { Handler } from "aws-lambda";
 import { ResourceGroups } from "aws-sdk";
-import { GroupIdentifier } from "aws-sdk/clients/resourcegroups"
+import { GroupIdentifier } from "aws-sdk/clients/resourcegroups";
+import "../keepalive";
 
 interface Event {
     Items?: {
@@ -16,7 +17,6 @@ interface Event {
 export const handler: Handler<Event, Event> = async ({ Iterator }) => {
     const NextToken = Iterator ? Iterator.Token : undefined;
     const { GroupIdentifiers, NextToken: Token } = await new ResourceGroups().listGroups({ NextToken }).promise();
-
     return {
         Items: {
             Values: GroupIdentifiers,

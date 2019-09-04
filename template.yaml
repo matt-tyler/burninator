@@ -5,9 +5,85 @@ Globals:
   Function:
     Runtime: nodejs10.x
     Timeout: 20
-    ReservedConcurrentExecutions: 1
+    MemorySize: 1024
+    ReservedConcurrentExecutions: 10
     Tracing: Active
 Resources:
+  DeleteResourcesRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+
+  SQSReadPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      Roles:
+        - !Ref DeleteResourcesRole
+      PolicyName: LambdaSQSReadPolicy
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Action: 
+              - sqs:ReceiveMessage
+              - sqs:DeleteMessage
+              - sqs:GetQueueAttributes
+            Resource: !GetAtt Queue.Arn
+
+  DeletionPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      Roles: 
+        - !Ref DeleteResourcesRole
+      PolicyName: ResourceDeletionPolicy
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Action: s3:DeleteBucket
+            Resource: !Sub "arn:${AWS::Partition}:s3:::*"
+          - Effect: Allow
+            Action: s3:DeleteObject
+            Resource: !Sub "arn:${AWS::Partition}:s3:::*/*"
+          - Effect: Allow
+            Action: resource-groups:DeleteGroup
+            Resource: !Sub "arn:${AWS::Partition}:resource-groups:${AWS::Region}:${AWS::AccountId}:group/*"
+          - Effect: Allow
+            Action: [ servicecatalog:DeleteProduct ]
+            Resource: "*"
+    
+  DeleteResources:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: index.handler
+      CodeUri: src/DeleteResources
+      Role: !GetAtt DeleteResourcesRole.Arn
+      Events:
+        Queue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt Queue.Arn
+            BatchSize: 1
+            Enabled: true
+
+  FilterResourceGroups:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: index.handler
+      CodeUri: src/FilterResourceGroups
+      Policies:
+        - Statement:
+          - Action: resource-groups:GetTags
+            Effect: Allow
+            Resource: !Sub "arn:${AWS::Partition}:resource-groups:${AWS::Region}:${AWS::AccountId}:group*"
+
   ListResourceGroups:
     Type: AWS::Serverless::Function
     Properties:
@@ -73,7 +149,7 @@ Resources:
       TimeoutInMinutes: 5
       TemplateURL: ./template_iterator.yaml
       Parameters:
-        ProcessorArn: !GetAtt ResourcesLister.Outputs.Arn
+        ProcessorArn: !Ref ResourceGroupsFilter
         Input: >-
           {
             "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID.$": "$$.Execution.Id",
@@ -87,10 +163,55 @@ Resources:
             }
           }
 
+  ResourceGroupsFilter:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      RoleArn: !GetAtt ResourceGroupsFilterRole.Arn
+      DefinitionString: !Sub |
+        {
+          "StartAt": "FilterResourceGroups",
+          "States": {
+            "FilterResourceGroups": {
+              "Type": "Task",
+              "Resource": "${FilterResourceGroups.Arn}",
+              "InputPath": "$.Input.Iterator.Params",
+              "ResultPath": "$.Skip",
+              "Next": "Fork"
+            },
+            "Fork": {
+              "Type": "Choice",
+              "Default": "ProcessItem",
+              "Choices": [
+                {
+                  "Variable": "$.Skip",
+                  "BooleanEquals": true,
+                  "Next": "Succeed"
+                }
+              ]
+            },
+            "ProcessItem": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::states:startExecution",
+              "Parameters": {
+                "Input": {
+                  "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID.$": "$$.Execution.Id",
+                  "Input.$": "$.Input"
+                },
+                "StateMachineArn": "${ResourcesLister.Outputs.Arn}"
+              },
+              "ResultPath": "$.Result",
+              "End": true
+            },
+            "Succeed": {
+              "Type": "Succeed"
+            }
+          }
+        }
+
   ProcessResourceGroups:
     Type: AWS::StepFunctions::StateMachine
     Properties:
-      RoleArn: !GetAtt StatesExecutionRole.Arn
+      RoleArn: !GetAtt ProcessResourceGroupsRole.Arn
       DefinitionString: !Sub |
         {
           "StartAt": "EnqueueResources",
@@ -109,16 +230,9 @@ Resources:
               "Resource": "arn:aws:states:::sqs:sendMessage",
               "Parameters": {
                 "QueueUrl": "${Queue}",
-                "MessageBody": "0",
-                "MessageAttributes": {
-                  "ResourceType": {
-                    "DataType": "String",
-                    "StringValue": "AWS::ResourceGroups::Group"
-                  },
-                  "ResourceArn": {
-                    "DataType": "String",
-                    "StringValue.$": "$.GroupArn"
-                  }
+                "MessageBody": { 
+                  "ResourceType": "AWS::ResourceGroups::Group", 
+                  "ResourceArn.$": "$.GroupArn"
                 }
               },
               "End": true
@@ -126,7 +240,7 @@ Resources:
           }
         }
 
-  StatesExecutionRole:
+  ProcessResourceGroupsRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
@@ -148,5 +262,35 @@ Resources:
                 Action: sqs:SendMessage
                 Resource: !GetAtt Queue.Arn
 
+  ResourceGroupsFilterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: states.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: StatesExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt FilterResourceGroups.Arn
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !GetAtt ResourcesLister.Outputs.Arn
+
   Queue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 180
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DLQ.Arn
+        maxReceiveCount: 5
+
+  DLQ:
     Type: AWS::SQS::Queue

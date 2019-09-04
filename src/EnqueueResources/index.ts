@@ -2,6 +2,7 @@ import { ResourceIdentifier } from "aws-sdk/clients/resourcegroups";
 import { SendMessageBatchRequestEntry } from "aws-sdk/clients/sqs";
 import { SQS } from "aws-sdk";
 import { Handler } from "aws-lambda";
+import "../keepalive";
 
 interface Event {
     Items: ResourceIdentifier[];
@@ -9,17 +10,7 @@ interface Event {
 
 const ToEntry = ({ ResourceType, ResourceArn }: ResourceIdentifier): SendMessageBatchRequestEntry => ({
     Id: ResourceArn.replace(/[/:.]/g, "_"),
-    MessageBody: "0",
-    MessageAttributes: {
-        ResourceType: {
-            DataType: "String",
-            StringValue: ResourceType
-        },
-        ResourceArn: {
-            DataType: "String",
-            StringValue: ResourceArn
-        }
-    }
+    MessageBody: JSON.stringify({ ResourceType, ResourceArn })
 });
 
 export const handler: Handler<Event> = async ({ Items }) => {

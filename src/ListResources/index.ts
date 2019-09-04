@@ -1,6 +1,7 @@
 import { Handler } from "aws-lambda";
 import { ResourceGroups } from "aws-sdk";
 import { ResourceIdentifier } from "aws-sdk/clients/resourcegroups";
+import "../keepalive";
 
 interface Event {
     Items?: {
